@@ -1,69 +1,221 @@
-import { file, write } from "bun";
+import { write } from "bun";
 
-type DBInstance = {
-    path: string;
-    data: Array<Record<string, any>>;
+type QueryCondition<T = any> = {
+  $eq?: T;
+  $ne?: T;
+  $gt?: T;
+  $gte?: T;
+  $lt?: T;
+  $lte?: T;
+  $in?: T[];
+  $nin?: T[];
+  $contains?: string;
+  $startsWith?: string;
+  $endsWith?: string;
 };
 
-let dbInstance: DBInstance | null = null;
+type Query<T> = {
+  [K in keyof T]?: T[K] | QueryCondition<T[K]>;
+};
 
-function matchesQuery(obj: Record<string, any>, query: Record<string, any>): boolean {
-    for (const [key, value] of Object.entries(query)) {
-        if (obj[key] !== value) return false;
+interface DBOptions {
+  autoSave?: boolean;
+  prettyPrint?: boolean;
+  validation?: (record: any) => boolean;
+  /** @default 100 */
+  saveDebounceMs?: number;
+}
+
+export class Database<T extends Record<string, any>> {
+  private data: T[];
+  private indexes = new Map<string, Map<any, Set<number>>>();
+  private saveTimer?: Timer;
+  private pendingWrites = false;
+
+  constructor(
+    private path: string,
+    private options: Required<DBOptions> = {
+      autoSave: true,
+      prettyPrint: true,
+      validation: () => true,
+      saveDebounceMs: 100
     }
-    return true;
-};
+  ) {
+    this.data = this.loadSync();
+  }
 
-export async function createDB(filePath: string): Promise<void> {
-    const initialData: Array<Record<string, any>> = [];
+  static async initialize<T extends Record<string, any>>(
+    filePath: string,
+    options?: DBOptions
+  ): Promise<Database<T>> {
+    const db = new Database<T>(filePath, {
+      autoSave: true,
+      prettyPrint: true,
+      validation: () => true,
+      saveDebounceMs: 100,
+      ...options
+    });
+    await db.save(); // Initial save if new file
+    return db;
+  }
+
+  private loadSync(): T[] {
     try {
-        const existingFile = file(filePath);
-        const contents = await existingFile.text();
-        dbInstance = { path: filePath, data: contents ? JSON.parse(contents) : initialData };
+      const contents = Bun.readFileSync(this.path, "utf8");
+      return contents ? JSON.parse(contents) : [];
     } catch {
-        await write(filePath, JSON.stringify(initialData, null, 2));
-        dbInstance = { path: filePath, data: initialData };
-    };
-};
+      return [];
+    }
+  }
 
-async function save(): Promise<void> {
-    if (!dbInstance) throw new Error("Database not initialized");
-    await write(dbInstance.path, JSON.stringify(dbInstance.data, null, 2));
-};
+  private async save(): Promise<void> {
+    if (this.saveTimer) clearTimeout(this.saveTimer);
+    this.pendingWrites = false;
+    
+    const space = this.options.prettyPrint ? 2 : undefined;
+    await write(this.path, JSON.stringify(this.data, null, space));
+  }
 
-export async function add(record: Record<string, any>): Promise<Record<string, any>> {
-    if (!dbInstance) throw new Error("Database not initialized");
-    dbInstance.data.push(record);
-    await save();
-    return record;
-};
+  private queueSave(): void {
+    if (!this.options.autoSave) return;
+    this.pendingWrites = true;
+    
+    if (this.saveTimer) clearTimeout(this.saveTimer);
+    this.saveTimer = setTimeout(() => {
+      if (this.pendingWrites) this.save().catch(console.error);
+    }, this.options.saveDebounceMs);
+  }
 
-export async function find(query: Record<string, any>): Promise<Array<Record<string, any>>> {
-    if (!dbInstance) throw new Error("Database not initialized");
-    return dbInstance.data.filter((item) => matchesQuery(item, query));
-};
+  private matchesQuery(item: T, query: Query<T>): boolean {
+    return Object.entries(query).every(([key, condition]) => {
+      const itemValue = item[key];
+      
+      if (typeof condition !== "object" || condition === null) {
+        return itemValue === condition;
+      }
 
-export async function modify(query: Record<string, any>, changes: Record<string, any>): Promise<number> {
-    if (!dbInstance) throw new Error("Database not initialized");
-    let modifiedCount = 0;
+      return Object.entries(condition as QueryCondition).every(([operator, value]) => {
+        switch (operator) {
+          case "$eq": return itemValue === value;
+          case "$ne": return itemValue !== value;
+          case "$gt": return itemValue > value;
+          case "$gte": return itemValue >= value;
+          case "$lt": return itemValue < value;
+          case "$lte": return itemValue <= value;
+          case "$in": return (value as unknown[]).includes(itemValue);
+          case "$nin": return !(value as unknown[]).includes(itemValue);
+          case "$contains": 
+            return typeof itemValue === "string" && itemValue.includes(value as string);
+          case "$startsWith":
+            return typeof itemValue === "string" && itemValue.startsWith(value as string);
+          case "$endsWith":
+            return typeof itemValue === "string" && itemValue.endsWith(value as string);
+          default: throw new Error(`Unsupported operator: ${operator}`);
+        }
+      });
+    });
+  }
 
-    dbInstance.data = dbInstance.data.map((item) => {
-        if (matchesQuery(item, query)) {
-            modifiedCount++;
-            return { ...item, ...changes };
-        };
-        return item;
+  insert(record: Omit<T, "id"> & Partial<Pick<T, "id">>): T {
+    if (!this.options.validation(record)) {
+      throw new Error("Record validation failed");
+    }
+
+    const newRecord = {
+      ...record,
+      id: record.id ?? crypto.randomUUID()
+    } as unknown as T;
+
+    const index = this.data.length;
+    this.data.push(newRecord);
+    
+    // Update indexes
+    this.indexes.forEach((indexMap, key) => {
+      const value = newRecord[key as keyof T];
+      if (value !== undefined) {
+        if (!indexMap.has(value)) indexMap.set(value, new Set());
+        indexMap.get(value)?.add(index);
+      }
     });
 
-    if (modifiedCount === 0) throw new Error("No records matched query");
-    await save();
-    return modifiedCount;
-};
+    this.queueSave();
+    return newRecord;
+  }
 
-export async function remove(query: Record<string, any>): Promise<number> {
-    if (!dbInstance) throw new Error("Database not initialized");
-    const originalLength = dbInstance.data.length;
-    dbInstance.data = dbInstance.data.filter((item) => !matchesQuery(item, query));
-    await save();
-    return originalLength - dbInstance.data.length;
-};
+  find(query?: Query<T>): T[] {
+    if (!query) return [...this.data];
+    
+    // Try to use indexes for simple equality queries
+    const simpleQuery = Object.entries(query)
+      .filter(([_, value]) => typeof value !== "object")
+      .map(([key, value]) => ({ key, value }));
+
+    if (simpleQuery.length === 1) {
+      const first = simpleQuery[0];
+      if (first && this.indexes.has(first.key)) {
+        const indexes = this.indexes.get(first.key)?.get(first.value);
+        if (indexes) {
+          return Array.from(indexes)
+            .map(i => this.data[i])
+            .filter((item): item is T => item !== undefined);
+        }
+      }
+    }
+
+    return this.data.filter(item => this.matchesQuery(item, query));
+  }
+
+  update(query: Query<T>, changes: Partial<T>): number {
+    let modifiedCount = 0;
+    const indexesToUpdate: number[] = [];
+
+    this.data.forEach((item, i) => {
+      if (this.matchesQuery(item, query)) {
+        modifiedCount++;
+        this.data[i] = { ...item, ...changes };
+        indexesToUpdate.push(i);
+      }
+    });
+
+    // Update indexes for modified items
+    if (modifiedCount > 0) {
+      this.indexes.forEach((indexMap, key) => {
+        indexesToUpdate.forEach(i => {
+          const oldValue = this.data[i][key as keyof T]!;
+          const newValue = this.data[i][key as keyof T]!;
+          
+          indexMap.get(oldValue)?.delete(i);
+          if (!indexMap.has(newValue)) indexMap.set(newValue, new Set());
+          indexMap.get(newValue)?.add(i);
+        });
+      });
+
+      this.queueSave();
+    }
+
+    return modifiedCount;
+  }
+
+  delete(query: Query<T>): number {
+    const indexesToDelete = new Set<number>();
+    
+    this.data.forEach((item, i) => {
+      if (this.matchesQuery(item, query)) {
+        indexesToDelete.add(i);
+      }
+    });
+
+    // Remove in reverse order to maintain correct indexes
+    const sorted = Array.from(indexesToDelete).sort((a, b) => b - a);
+    sorted.forEach(i => this.data.splice(i, 1));
+
+    // Rebuild indexes after deletion
+    this.indexes.clear();
+
+    if (sorted.length > 0) {
+      this.queueSave();
+    }
+    
+    return sorted.length;
+  }
+}
